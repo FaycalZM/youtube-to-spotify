@@ -1,12 +1,24 @@
 # -*- coding: utf-8 -*-
 
+import base64
 import os
 import flask
+from flask import logging
 import requests
 
 import google.oauth2.credentials
 import google_auth_oauthlib.flow
 import googleapiclient.discovery
+
+import urllib
+from dotenv import load_dotenv
+
+
+load_dotenv()
+
+SPOTIFY_CLIENT_ID = os.getenv("SPOTIFY_CLIENT_ID")
+SPOTIFY_CLIENT_SECRET = os.getenv("SPOTIFY_CLIENT_SECRET")
+SPOTIFY_CALLBACK_URI = os.getenv("SPOTIFY_CALLBACK_URI")
 
 # This variable specifies the name of a file that contains the OAuth 2.0
 # information for this application, including its client_id and client_secret.
@@ -35,6 +47,8 @@ def index():
   return print_index_table()
 
 
+
+# Youtube related endpoints
 @app.route('/test')
 def test_api_request():
   if 'credentials' not in flask.session:
@@ -47,14 +61,150 @@ def test_api_request():
   youtube = googleapiclient.discovery.build(
       API_SERVICE_NAME, API_VERSION, credentials=credentials)
 
-  channel = youtube.channels().list(mine=True, part='snippet').execute()
+  playlist = youtube.playlistItems().list(
+        part="snippet,contentDetails",
+        maxResults=25,
+        playlistId="PL4WBYFP7iGJrLDLyn3WS0cqLBAziFDYDD"
+    ).execute()
 
+  songs = [item['snippet']['title'] for item in playlist['items']]
   # Save credentials back to session in case access token was refreshed.
-  # ACTION ITEM: In a production app, you likely want to save these
-  #              credentials in a persistent database instead.
   flask.session['credentials'] = credentials_to_dict(credentials)
 
-  return flask.jsonify(**channel)
+  new_spotify_ids = []
+  for songName in songs:
+      track = get_spotify_track_id(songName)
+      if track:
+        newid = track["tracks"]["items"][0]["id"]
+        new_spotify_id = f"spotify:track:{str(newid)}"
+        new_spotify_ids.append(new_spotify_id)
+  songs_list = ','.join(new_spotify_ids)
+  return add_new_songs_in_spotify_playlist(songs_list,"0WjvYNsMUoPXaZ9QYTh8F2")
+  
+def add_new_songs_in_spotify_playlist(songs_list, spotify_playlist):
+    if len(songs_list) > 0:   
+      body = {"uris": songs_list}
+      headers = {'Authorization': f'Bearer {flask.session["spotify_credentials"]["access_token"]}'}
+      playlist_url = f"https://api.spotify.com/v1/playlists/{spotify_playlist}/tracks"
+      newrequest = requests.post(playlist_url, json=body, headers=headers)
+      print(newrequest.status_code)
+      if newrequest.status_code == 200 or newrequest.status_code == 201:
+          return "success"
+      else:
+          return "failed"
+    else:
+       return "youtube playlist is empty or invalid tracks found"
+
+# search for a track in spotify by name
+def get_spotify_track_id(songName):
+  print(songName)
+  try:
+    if "-" in songName:
+        track = songName.split("-")[1].strip()
+        artist = songName.split("-")[0].strip()
+        data = {"q": urllib.parse.quote(f'track:{track} artist:{artist}'), "type": "track", "limit": 1}
+        headers = {"Authorization": f"Bearer {flask.session['spotify_credentials']['access_token']}"}
+        url = 'https://api.spotify.com/v1/search'
+
+        response = requests.get(url, params=data, headers=headers)
+        print(f'The status code is {response.status_code}')
+
+        if response.status_code == 401:  # specifically check for unauthorized status
+            print("Token might be expired. Attempting to refresh the token.")
+            refresh_spotify_token()
+            # Fetch the updated token
+            new_access_token = flask.session['spotify_credentials']['access_token']
+            print(f'Updated access token: {new_access_token}')
+            headers = {"Authorization": f"Bearer {new_access_token}"}
+            response = requests.get(url, params=data, headers=headers)
+            print(f'New response status code after token refresh: {response.status_code}')
+
+        return response.json()
+    else:
+        print("Song format is incorrect. It should be 'Artist - Track'.")
+        return None
+
+  except Exception as e:
+    print(f"An error occurred: {e}")
+    return None
+
+
+def refresh_spotify_token():
+    try:
+        flask.session.modified = True
+        data = {
+            'grant_type': 'refresh_token',
+            'refresh_token': flask.session["spotify_credentials"]['refresh_token']
+        }
+        encoded_credentials = base64.b64encode(f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}".encode('utf-8')).decode("utf-8")
+        headers = {
+            'content-type': 'application/x-www-form-urlencoded',
+            'Authorization': f'Basic {encoded_credentials}'
+        }
+        response = requests.post("https://accounts.spotify.com/api/token", data=data, headers=headers)
+        print(f'Refresh token response status code: {response.status_code}')
+
+        if response.status_code == 200:
+            new_credentials = response.json()
+            flask.session["spotify_credentials"]['access_token'] = new_credentials['access_token']
+            print(f'Access token refreshed successfully. New token: {new_credentials["access_token"]}')
+        else:
+            print(f'Failed to refresh token: {response.json()}')
+            raise Exception('Failed to refresh token')
+
+    except Exception as e:
+        print(f"An error occurred while refreshing the token: {e}")
+        raise
+
+
+@app.route("/sync_songs",methods=["GET","POST"])
+def sync_songs():
+    if flask.request.method == "GET":
+
+        if 'credentials' not in flask.session:
+            return flask.redirect('authorize')
+        if 'spotify_credentials' not in flask.session:
+            return flask.redirect('spotify_authorize')
+
+        return flask.render_template('index.html')
+
+    elif flask.request.method == "POST":
+
+        data = flask.request.form
+        spotify_playlist_id = data['spotify_url'].split("/")[-1]
+        youtube_playlist_id = data['youtube_url'].split("=")[1]
+        return start_sync_process(youtube_playlist_id, spotify_playlist_id)
+
+
+def start_sync_process(youtube_playlist, spotify_playlist):
+    credentials = google.oauth2.credentials.Credentials(
+        **flask.session['credentials'])
+
+    youtube = googleapiclient.discovery.build(
+        API_SERVICE_NAME, API_VERSION, credentials=credentials)
+
+    playlist = youtube.playlistItems().list(
+        part="snippet,contentDetails",
+        maxResults=25,
+        playlistId=youtube_playlist
+    ).execute()
+    songs = [item['snippet']['title'] for item in playlist['items']]
+    # Save credentials back to session in case access token was refreshed.
+    # ACTION ITEM: In a production app, you likely want to save these
+    #              credentials in a persistent database instead.
+    flask.session['credentials'] = credentials_to_dict(credentials)
+
+    new_spotify_ids = []
+    for songName in songs:
+        track = get_spotify_track_id(songName)
+        if track:
+          newid = track["tracks"]["items"][0]["id"]
+          new_spotify_id = f"spotify:track:{str(newid)}"
+          new_spotify_ids.append(new_spotify_id)
+
+    return add_new_songs_in_spotify_playlist(new_spotify_ids, spotify_playlist)
+
+
 
 
 @app.route('/authorize')
@@ -106,7 +256,7 @@ def oauth2callback():
   credentials = flow.credentials
   flask.session['credentials'] = credentials_to_dict(credentials)
 
-  return flask.redirect(flask.url_for('test_api_request'))
+  return flask.redirect('/')
 
 
 @app.route('/revoke')
@@ -135,6 +285,54 @@ def clear_credentials():
     del flask.session['credentials']
   return ('Credentials have been cleared.<br><br>' +
           print_index_table())
+
+# Spotify Related endpoints
+@app.route("/spotify_authorize")
+def spotify_authorize():
+    scopes = 'playlist-modify-private playlist-modify-public'
+    params = {"client_id":SPOTIFY_CLIENT_ID,
+              "response_type":"code",
+              "redirect_uri": SPOTIFY_CALLBACK_URI,
+              "show_dialog" : True,
+              "scope": scopes
+              }
+    params_encoded = urllib.parse.urlencode(params)
+
+    return flask.redirect(f'https://accounts.spotify.com/authorize?{params_encoded}')
+
+@app.route("/spotify_callback")
+def spotify_callback():
+    newcode = flask.request.args.get("code")
+    newtoken = request_access_token(newcode)
+    flask.session["spotify_credentials"] = newtoken
+    return flask.redirect(flask.url_for("sync_songs"))
+
+# Just for debugging purpose
+@app.route("/spotify_after_callback")
+def spotify_after_callback():
+    return dict(flask.session)
+
+
+
+def request_access_token(code):
+    params = {
+        "code": code,
+        "grant_type": "authorization_code",
+        "redirect_uri": SPOTIFY_CALLBACK_URI
+
+    }
+
+    headers = {
+        'content-type': 'application/x-www-form-urlencoded',
+        "Authorization": "Basic "+ base64.b64encode(f"{SPOTIFY_CLIENT_ID}:{SPOTIFY_CLIENT_SECRET}".encode('utf-8')).decode('utf-8')
+
+
+    }
+    newpost_url = "https://accounts.spotify.com/api/token"
+    newpost_request = requests.post(newpost_url,data=params, headers=headers)
+    return newpost_request.json()
+
+
 
 
 def credentials_to_dict(credentials):
